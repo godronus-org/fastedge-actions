@@ -58,6 +58,7 @@ jobs:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
           PR_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           case "$EVENT:$GITHUB_REF" in
             release:*)            mode=release;    version=$RELEASE_TAG ;;
@@ -71,6 +72,12 @@ jobs:
               fi ;;
             *) echo "::error::FastEdge release does not handle $EVENT on $GITHUB_REF"; exit 1 ;;
           esac
+          # A version's binary is never replaced, and one action can fire two modes
+          # ("Create release" with a new tag = release + tag push): skip if done.
+          if [ -n "${version:-}" ] && gh release view "$version" --repo "$GITHUB_REPOSITORY" --json assets \
+               --jq '.assets[].name' 2>/dev/null | grep -q '\.wasm$'; then
+            echo "::notice::$version already has its .wasm — nothing to build"; mode=skip
+          fi
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
           echo "version=${version:-}" >> "$GITHUB_OUTPUT"
           echo "preview=${preview:-}" >> "$GITHUB_OUTPUT"
@@ -197,10 +204,12 @@ jobs:
           fi
           existing=$(gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" --json assets --jq '[.assets[].name|select(endswith(".wasm"))]|join(" ")')
           if [ -n "$existing" ]; then
-            # A version's binary is never replaced (e.g. "Create release" fires both A and B).
             echo "::notice::$VERSION already has $existing — not replaced"; exit 0
           fi
-          gh release upload "$VERSION" "$WASM" "$WASM.sha256" --repo "$GITHUB_REPOSITORY"
+          # Lost a race with a parallel run of the same version → it published first.
+          gh release upload "$VERSION" "$WASM" "$WASM.sha256" --repo "$GITHUB_REPOSITORY" || {
+            gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | grep -q '\.wasm$' \
+              && echo "::notice::$VERSION was published by a parallel run — not replaced" || exit 1; }
 
       - name: Upload preview artifact
         if: steps.mode.outputs.mode == 'preview'
