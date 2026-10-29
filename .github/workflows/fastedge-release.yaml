@@ -119,9 +119,22 @@ jobs:
               rustup target add "$TARGET"
               cargo build --release --target "$TARGET" ;;
             js)
+              # Respect package.json "packageManager"; without it, never take corepack's
+              # "latest" (a new major can reject an existing lockfile) — use the major
+              # that matches the lockfile instead.
+              pinned=$(jq -r '.packageManager // empty' package.json)
+              corepack enable
               case "$PM" in
-                pnpm) corepack enable && pnpm install --frozen-lockfile && pnpm run build ;;
-                yarn) corepack enable && yarn install --immutable && yarn build ;;
+                pnpm)
+                  [ -n "$pinned" ] || corepack prepare pnpm@10 --activate   # lockfileVersion 9
+                  pnpm --version && pnpm install --frozen-lockfile && pnpm run build ;;
+                yarn)
+                  if [ -z "$pinned" ] && head -3 yarn.lock | grep -q "yarn lockfile v1"; then
+                    corepack prepare yarn@1 --activate && yarn install --frozen-lockfile
+                  else
+                    yarn install --immutable
+                  fi
+                  yarn build ;;
                 npm)  npm ci && npm run build ;;
               esac ;;
             *) echo "::error::No Cargo.toml or package.json — set the build-command input"; exit 1 ;;
