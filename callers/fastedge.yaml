@@ -7,12 +7,10 @@ on:
   # A — "Create release" in GitHub: assets attached to that Release.
   release:
     types: [published]
-  # B — pushing a v* tag creates the Release.
+  # B and C share one push: block — uncomment push: plus the line(s) you want.
   # push:
-  #   tags: ["v*"]
-  # C — every merge to main becomes a pre-release "main-<sha7>".
-  # push:
-  #   branches: [main]
+  #   tags: ["v*"]        # B — pushing a v* tag creates the Release.
+  #   branches: [main]    # C — every merge to main becomes a pre-release "main-<sha7>".
   # D — pull requests build a preview (not for PRs from forks).
   pull_request:
 
