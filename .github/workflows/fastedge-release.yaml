@@ -1,0 +1,215 @@
+name: FastEdge release
+
+# Builds one FastEdge .wasm and publishes it where the Gcore portal's
+# Deployments tab reads versions from. No Gcore credentials: the portal does
+# the deploy. Called from a repo's caller workflow (callers/fastedge.yaml);
+# what triggers the caller decides what is produced:
+#
+#   release: published     → assets attached to that Release          (mode A)
+#   push: tags v*          → Release created for the tag + assets     (mode B)
+#   push: branches main    → pre-release "main-<sha7>" + assets       (mode C)
+#   pull_request           → workflow artifact for a preview          (mode D)
+#                            (skipped for PRs from forks)
+#
+# Assets (the contract the portal relies on): exactly one <name>.wasm and
+# <name>.wasm.sha256 (sha256sum format). Never replaced once published.
+
+on:
+  workflow_call:
+    inputs:
+      build-command:
+        description: "Build command. Default — Rust: cargo build --release for the target in .cargo/config.toml; JS/TS: the package.json \"build\" script."
+        type: string
+        default: ""
+      output:
+        description: "Path of the .wasm to publish. Default — the single .wasm the build produced."
+        type: string
+        default: ""
+      test-command:
+        description: "Test command, run after the build. Default — the package.json \"test\" script, or fastedge-test/ when present."
+        type: string
+        default: ""
+      run-tests:
+        description: "Run tests (the default command or test-command)."
+        type: boolean
+        default: true
+    outputs:
+      version:
+        description: "Release tag (empty for previews)."
+        value: ${{ jobs.build.outputs.version }}
+      sha256:
+        description: "SHA-256 of the published .wasm."
+        value: ${{ jobs.build.outputs.sha256 }}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.mode.outputs.version }}
+      sha256: ${{ steps.wasm.outputs.sha256 }}
+    steps:
+      - name: Mode
+        id: mode
+        env:
+          EVENT: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          PR_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          case "$EVENT:$GITHUB_REF" in
+            release:*)            mode=release;    version=$RELEASE_TAG ;;
+            push:refs/tags/v*)    mode=tag;        version=$GITHUB_REF_NAME ;;
+            push:refs/heads/main) mode=main;       version="main-${GITHUB_SHA::7}" ;;
+            pull_request:*)
+              if [ "$PR_REPO" != "$GITHUB_REPOSITORY" ]; then
+                echo "::notice::PR from a fork ($PR_REPO) — no preview build"; mode=skip
+              else
+                mode=preview; preview="pr-$PR_NUMBER"
+              fi ;;
+            *) echo "::error::FastEdge release does not handle $EVENT on $GITHUB_REF"; exit 1 ;;
+          esac
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "version=${version:-}" >> "$GITHUB_OUTPUT"
+          echo "preview=${preview:-}" >> "$GITHUB_OUTPUT"
+          echo "Mode: $mode ${version:-$preview}"
+
+      - uses: actions/checkout@v4
+        if: steps.mode.outputs.mode != 'skip'
+
+      # Detect the language and package manager (presets — inputs override).
+      - name: Detect
+        id: detect
+        if: steps.mode.outputs.mode != 'skip'
+        run: |
+          if [ -f Cargo.toml ]; then
+            lang=rust
+            target=$(sed -n 's/^target *= *"\(.*\)"/\1/p' .cargo/config.toml 2>/dev/null | head -1)
+            echo "target=${target:-wasm32-wasip1}" >> "$GITHUB_OUTPUT"
+          elif [ -f package.json ]; then
+            lang=js
+            if [ -f pnpm-lock.yaml ]; then pm=pnpm; elif [ -f yarn.lock ]; then pm=yarn; else pm=npm; fi
+            echo "pm=$pm" >> "$GITHUB_OUTPUT"
+          else
+            lang=other
+          fi
+          echo "lang=$lang" >> "$GITHUB_OUTPUT"
+          echo "Detected: $lang"
+
+      - uses: actions/setup-node@v4
+        if: steps.mode.outputs.mode != 'skip' && (steps.detect.outputs.lang == 'js' || hashFiles('fastedge-test/package.json') != '')
+        with:
+          node-version: 22
+
+      - name: Build
+        if: steps.mode.outputs.mode != 'skip'
+        env:
+          LANG_: ${{ steps.detect.outputs.lang }}
+          PM: ${{ steps.detect.outputs.pm }}
+          TARGET: ${{ steps.detect.outputs.target }}
+          BUILD: ${{ inputs.build-command }}
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+        run: |
+          touch "$RUNNER_TEMP/build-start"
+          if [ -n "$BUILD" ]; then eval "$BUILD"; exit; fi
+          case "$LANG_" in
+            rust)
+              rustup target add "$TARGET"
+              cargo build --release --target "$TARGET" ;;
+            js)
+              case "$PM" in
+                pnpm) corepack enable && pnpm install --frozen-lockfile && pnpm run build ;;
+                yarn) corepack enable && yarn install --immutable && yarn build ;;
+                npm)  npm ci && npm run build ;;
+              esac ;;
+            *) echo "::error::No Cargo.toml or package.json — set the build-command input"; exit 1 ;;
+          esac
+
+      - name: Locate wasm
+        id: wasm
+        if: steps.mode.outputs.mode != 'skip'
+        env:
+          OUTPUT: ${{ inputs.output }}
+        run: |
+          if [ -n "$OUTPUT" ]; then
+            files=("$OUTPUT")
+          else
+            # Only .wasm files this build produced (not node_modules or Rust deps/).
+            mapfile -t files < <(find . -name '*.wasm' -newer "$RUNNER_TEMP/build-start" \
+              -not -path '*/node_modules/*' -not -path '*/deps/*')
+          fi
+          if [ "${#files[@]}" -ne 1 ] || [ ! -f "${files[0]}" ]; then
+            echo "::error::Expected exactly one .wasm, found ${#files[@]}: ${files[*]} — set the output input"; exit 1
+          fi
+          name=$(basename "${files[0]}")
+          dir="$RUNNER_TEMP/asset" && mkdir -p "$dir" && cp "${files[0]}" "$dir/$name"
+          (cd "$dir" && sha256sum "$name" > "$name.sha256")
+          echo "path=$dir/$name" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(cut -d' ' -f1 "$dir/$name.sha256")" >> "$GITHUB_OUTPUT"
+          echo "Built ${files[0]} ($(du -h "${files[0]}" | cut -f1))"
+
+      - name: Test
+        if: steps.mode.outputs.mode != 'skip' && inputs.run-tests
+        env:
+          TEST: ${{ inputs.test-command }}
+          PM: ${{ steps.detect.outputs.pm }}
+        run: |
+          if [ -n "$TEST" ]; then eval "$TEST"; exit; fi
+          ran=false
+          if [ -f package.json ] && jq -e '.scripts.test' package.json >/dev/null; then
+            ${PM:-npm} run test; ran=true
+          fi
+          # Rust layout: fastedge-test/ is its own Node project (JS repos run it via their test script).
+          if [ -f fastedge-test/package.json ] && [ ! -f package.json ]; then
+            (cd fastedge-test && npm ci --no-audit --no-fund && npm test); ran=true
+          fi
+          [ "$ran" = true ] || echo "::warning::No tests found — set test-command, or add a test script / fastedge-test/"
+
+      - name: Publish release assets
+        if: contains(fromJSON('["release","tag","main"]'), steps.mode.outputs.mode)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ steps.mode.outputs.mode }}
+          VERSION: ${{ steps.mode.outputs.version }}
+          WASM: ${{ steps.wasm.outputs.path }}
+          NAME: ${{ steps.wasm.outputs.name }}
+        run: |
+          if ! gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            flags=(--target "$GITHUB_SHA" --title "$VERSION")
+            if [ "$MODE" = main ]; then flags+=(--prerelease --notes "Build of main at $GITHUB_SHA"); else flags+=(--generate-notes); fi
+            gh release create "$VERSION" --repo "$GITHUB_REPOSITORY" "${flags[@]}"
+          fi
+          existing=$(gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" --json assets --jq '[.assets[].name|select(endswith(".wasm"))]|join(" ")')
+          if [ -n "$existing" ]; then
+            # A version's binary is never replaced (e.g. "Create release" fires both A and B).
+            echo "::notice::$VERSION already has $existing — not replaced"; exit 0
+          fi
+          gh release upload "$VERSION" "$WASM" "$WASM.sha256" --repo "$GITHUB_REPOSITORY"
+
+      - name: Upload preview artifact
+        if: steps.mode.outputs.mode == 'preview'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fastedge-preview-${{ steps.mode.outputs.preview }}
+          path: |
+            ${{ steps.wasm.outputs.path }}
+            ${{ steps.wasm.outputs.path }}.sha256
+          retention-days: 14
+
+      - name: Summary
+        if: steps.mode.outputs.mode != 'skip'
+        env:
+          MODE: ${{ steps.mode.outputs.mode }}
+          VERSION: ${{ steps.mode.outputs.version }}
+          PREVIEW: ${{ steps.mode.outputs.preview }}
+          NAME: ${{ steps.wasm.outputs.name }}
+          SHA: ${{ steps.wasm.outputs.sha256 }}
+        run: |
+          {
+            echo "### FastEdge $MODE: ${VERSION:-$PREVIEW}"
+            echo "- wasm: \`$NAME\`"
+            echo "- sha256: \`$SHA\`"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
